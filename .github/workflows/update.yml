@@ -1,0 +1,119 @@
+name: Update dynamic rules
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dynamic-rules
+  cancel-in-progress: false
+
+env:
+  SCRIPTS_DIR: scripts
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # OnlyFans restricts requests based on the TLS fingerprint of the client.
+      - name: Cache curl-impersonate
+        id: cache-curl-impersonate
+        uses: actions/cache@v4
+        with:
+          path: curl-impersonate
+          key: ${{ runner.os }}-curl-impersonate-0.6.1
+
+      - name: Download curl-impersonate
+        if: steps.cache-curl-impersonate.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p curl-impersonate
+          curl --fail --location --silent --show-error \
+            --output curl-impersonate.tar.gz \
+            https://github.com/lwthiker/curl-impersonate/releases/download/v0.6.1/curl-impersonate-v0.6.1.x86_64-linux-gnu.tar.gz
+          tar --extract --file curl-impersonate.tar.gz --directory curl-impersonate
+          rm curl-impersonate.tar.gz
+
+      - name: Fetch latest obfuscated script
+        id: fetch
+        run: |
+          set -euo pipefail
+          mkdir -p "$SCRIPTS_DIR/obfuscated"
+
+          webpage_source="$(
+            ./curl-impersonate/curl_chrome116 \
+              --silent --show-error --fail https://onlyfans.com
+          )"
+          js_url="$(
+            printf '%s' "$webpage_source" |
+              grep -oP 'https:\/\/static2\.onlyfans\.com\/static\/prod\/[a-f0-9]\/202[567]\d{8}-[a-f0-9]{10}\/[a-f0-9]{4}\.js' |
+              head -n 1
+          )"
+          if [ -z "$js_url" ]; then
+            echo "No matching JavaScript file found in the webpage source." >&2
+            exit 1
+          fi
+
+          script_id="$(printf '%s' "$js_url" | grep -oP '202[567]\d{8}-[a-f0-9]{10}')"
+          output_file="$SCRIPTS_DIR/obfuscated/$script_id.js"
+          ./curl-impersonate/curl-impersonate-chrome \
+            --silent --show-error --fail \
+            --header "User-Agent: Mozilla/5.0" \
+            --output "$output_file" "$js_url"
+          test -s "$output_file"
+          echo "script_id=$script_id" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Deobfuscate
+        env:
+          SCRIPT_ID: ${{ steps.fetch.outputs.script_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$SCRIPTS_DIR/deobfuscated"
+          npm run deobfuscate -- \
+            "$SCRIPTS_DIR/obfuscated/$SCRIPT_ID.js" \
+            "$SCRIPTS_DIR/deobfuscated/$SCRIPT_ID.js"
+          test -s "$SCRIPTS_DIR/deobfuscated/$SCRIPT_ID.js"
+
+      - name: Generate dynamic rules
+        env:
+          SCRIPT_ID: ${{ steps.fetch.outputs.script_id }}
+        run: |
+          set -euo pipefail
+          npm run --silent dynamic-rules -- \
+            "$SCRIPTS_DIR/deobfuscated/$SCRIPT_ID.js" > dynamic-rules.json
+          node -e \
+            "JSON.parse(require('fs').readFileSync('dynamic-rules.json', 'utf8'))"
+
+      - name: Commit and push changes
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- dynamic-rules.json; then
+            echo "dynamic-rules.json is already up to date."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dynamic-rules.json
+          git commit -m "Update dynamic-rules.json"
+          git push
